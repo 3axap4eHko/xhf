@@ -111,6 +111,11 @@ struct QuickRepository {
     private: bool,
 }
 
+#[derive(Deserialize)]
+struct RepositoryRevision {
+    sha: String,
+}
+
 #[derive(Serialize)]
 struct QuickSearchQuery<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,6 +191,33 @@ impl HubClient {
             Some(RepoType::Space) => repositories(response.spaces, RepoType::Space, limit),
             None => interleave_repositories(response, limit),
         })
+    }
+
+    pub fn resolve_revision(
+        &self,
+        repo: &RepoSpec,
+        repo_type: RepoType,
+        revision: &str,
+    ) -> AppResult<String> {
+        validate_revision(revision)?;
+        let url = self.endpoint_url(&[
+            "api",
+            repo_type.plural(),
+            repo.owner(),
+            repo.name(),
+            "revision",
+            revision,
+        ])?;
+        let request = self.authenticated(self.http.get(url).query(&[("expand", "sha")]));
+        let response = self.send_checked(request, "could not resolve repository revision")?;
+        let resolved: RepositoryRevision = serde_json::from_reader(response)
+            .map_err(|error| AppError::json("could not decode repository revision", error))?;
+        if resolved.sha.len() != 40 || !resolved.sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AppError::message(
+                "Hub returned an invalid repository commit hash",
+            ));
+        }
+        Ok(resolved.sha)
     }
 
     pub fn list_tree(
@@ -500,8 +532,10 @@ fn repository_page_url(url: &Url) -> Option<String> {
         [kind, owner, name, "resolve", ..] if matches!(*kind, "datasets" | "spaces") => {
             (Some(*kind), *owner, *name)
         }
-        ["api", "models", owner, name, "tree", ..] => (None, *owner, *name),
-        ["api", kind, owner, name, "tree", ..] if matches!(*kind, "datasets" | "spaces") => {
+        ["api", "models", owner, name, "tree" | "revision", ..] => (None, *owner, *name),
+        ["api", kind, owner, name, "tree" | "revision", ..]
+            if matches!(*kind, "datasets" | "spaces") =>
+        {
             (Some(*kind), *owner, *name)
         }
         _ => return None,
@@ -560,13 +594,120 @@ pub fn validate_remote_path(path: &str, require_file: bool) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+
     use reqwest::Url;
+
+    use crate::cli::RepoType;
 
     use super::{
         HubClient, QuickRepository, QuickSearchResponse, interleave_repositories, parse_next_link,
         repository_page_url, response_hint, validate_remote_path,
     };
     use reqwest::StatusCode;
+
+    fn revision_server(path: &str, status: &str, body: &str) -> (HubClient, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let expected_request = format!("GET {path}?expand=sha HTTP/1.1\r\n");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert_eq!(request, expected_request);
+            let mut authenticated = false;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header == "\r\n" || header.is_empty() {
+                    break;
+                }
+                if header.eq_ignore_ascii_case("authorization: Bearer test-token\r\n") {
+                    authenticated = true;
+                }
+            }
+            assert!(authenticated);
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (
+            HubClient::at_endpoint(&endpoint, Some("test-token".to_owned())).unwrap(),
+            server,
+        )
+    }
+
+    #[test]
+    fn resolves_branches_tags_and_hashes_for_all_repository_types() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let body = format!(r#"{{"sha":"{sha}"}}"#);
+        for (repo_type, revision, path) in [
+            (
+                RepoType::Model,
+                "main",
+                "/api/models/owner/repo/revision/main",
+            ),
+            (
+                RepoType::Dataset,
+                "v1.0",
+                "/api/datasets/owner/repo/revision/v1.0",
+            ),
+            (
+                RepoType::Space,
+                "refs/pr/1",
+                "/api/spaces/owner/repo/revision/refs%2Fpr%2F1",
+            ),
+            (
+                RepoType::Model,
+                sha,
+                "/api/models/owner/repo/revision/0123456789abcdef0123456789abcdef01234567",
+            ),
+        ] {
+            let (client, server) = revision_server(path, "200 OK", &body);
+            let result =
+                client.resolve_revision(&"owner/repo".parse().unwrap(), repo_type, revision);
+            server.join().unwrap();
+            assert_eq!(result.unwrap(), sha);
+        }
+    }
+
+    #[test]
+    fn rejects_unresolved_or_malformed_commit_hashes() {
+        for body in [
+            r#"{"sha":"main"}"#,
+            r#"{"sha":""}"#,
+            r#"{"sha":"0123456789abcdef0123456789abcdef0123456z"}"#,
+            r#"{"sha":null}"#,
+            "{}",
+        ] {
+            let (client, server) =
+                revision_server("/api/models/owner/repo/revision/main", "200 OK", body);
+            let result =
+                client.resolve_revision(&"owner/repo".parse().unwrap(), RepoType::Model, "main");
+            server.join().unwrap();
+            assert!(result.is_err(), "accepted {body}");
+        }
+    }
+
+    #[test]
+    fn propagates_revision_resolution_http_errors() {
+        let (client, server) = revision_server(
+            "/api/models/owner/repo/revision/missing",
+            "404 Not Found",
+            "Revision not found",
+        );
+        let result =
+            client.resolve_revision(&"owner/repo".parse().unwrap(), RepoType::Model, "missing");
+        server.join().unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("could not resolve repository revision"));
+        assert!(error.contains("404 Not Found"));
+    }
 
     fn repository(id: &str) -> QuickRepository {
         QuickRepository {
@@ -685,5 +826,27 @@ mod tests {
             repository_page_url(&dataset).as_deref(),
             Some("https://huggingface.co/datasets/owner/data")
         );
+    }
+
+    #[test]
+    fn preserves_gated_access_hints_during_revision_resolution() {
+        for (kind, prefix) in [
+            ("models", ""),
+            ("datasets", "datasets/"),
+            ("spaces", "spaces/"),
+        ] {
+            let url = Url::parse(&format!(
+                "https://huggingface.co/api/{kind}/owner/repo/revision/main?expand=sha"
+            ))
+            .unwrap();
+            let hint = response_hint(
+                StatusCode::FORBIDDEN,
+                "Access to this gated repo is restricted",
+                &url,
+            )
+            .unwrap();
+            assert!(hint.contains(&format!("https://huggingface.co/{prefix}owner/repo")));
+            assert!(hint.contains("retry after approval"));
+        }
     }
 }

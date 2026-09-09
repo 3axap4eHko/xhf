@@ -40,7 +40,8 @@ pub fn execute(
     if args.jobs == 0 {
         return Err(AppError::message("jobs must be greater than zero"));
     }
-    let entries = client.list_tree(&args.repo, args.repo_type, &args.revision)?;
+    let revision = client.resolve_revision(&args.repo, args.repo_type, &args.revision)?;
+    let entries = client.list_tree(&args.repo, args.repo_type, &revision)?;
     let patterns = PatternSet::compile(&args.patterns)?;
     let mut files: Vec<&TreeEntry> = entries
         .iter()
@@ -66,7 +67,7 @@ pub fn execute(
             AppError::message("selected repository files exceed the supported total size")
         })
     })?;
-    let tasks = prepare_tasks(client, args, &root, &files)?;
+    let tasks = prepare_tasks(client, args, &revision, &root, &files)?;
     let worker_count = args.jobs.min(tasks.len());
     let mut progress = ProgressWriter::new(progress_output, interactive_progress, &tasks);
     progress.start_batch(tasks.len(), total_bytes, &root, worker_count)?;
@@ -530,6 +531,7 @@ fn format_byte_value(mut bytes: f64) -> String {
 fn prepare_tasks(
     client: &HubClient,
     args: &DownloadArgs,
+    revision: &str,
     root: &Path,
     files: &[&TreeEntry],
 ) -> AppResult<Vec<DownloadTask>> {
@@ -544,7 +546,7 @@ fn prepare_tasks(
                 destination.display()
             ))
         })?;
-        let url = client.file_url(&args.repo, args.repo_type, &args.revision, &entry.path)?;
+        let url = client.file_url(&args.repo, args.repo_type, revision, &entry.path)?;
         let temporary_path = temporary_path(parent, &url);
         if !temporary_paths.insert(temporary_path.clone()) {
             return Err(AppError::message(format!(
@@ -1216,6 +1218,8 @@ mod tests {
     use crate::cli::{DownloadArgs, RepoType};
     use crate::hub::{HubClient, TreeEntry};
 
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
     fn test_directory(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from("/tmp/agents")
             .join(format!("xhf-download-{name}-{}", std::process::id()))
@@ -1241,6 +1245,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let maximum_active = Arc::new(AtomicUsize::new(0));
+        let resolved = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_active = Arc::clone(&active);
         let server_maximum_active = Arc::clone(&maximum_active);
@@ -1251,8 +1256,9 @@ mod tests {
                     Ok((stream, _)) => {
                         let active = Arc::clone(&server_active);
                         let maximum_active = Arc::clone(&server_maximum_active);
+                        let resolved = Arc::clone(&resolved);
                         connections.push(thread::spawn(move || {
-                            serve_download_request(stream, active, maximum_active);
+                            serve_download_request(stream, active, maximum_active, resolved);
                         }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1272,6 +1278,7 @@ mod tests {
         mut stream: TcpStream,
         active: Arc<AtomicUsize>,
         maximum_active: Arc<AtomicUsize>,
+        resolved: Arc<AtomicBool>,
     ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request_line = String::new();
@@ -1284,21 +1291,50 @@ mod tests {
             }
         }
         let path = request_line.split_whitespace().nth(1).unwrap();
-        if path.starts_with("/api/models/owner/repo/tree/main") {
+        if path == "/api/models/owner/repo/revision/main?expand=sha" {
+            assert!(
+                !resolved.swap(true, Ordering::AcqRel),
+                "revision resolved more than once"
+            );
+            let body = format!(r#"{{"sha":"{COMMIT}"}}"#);
+            write_response(&mut stream, "application/json", body.as_bytes());
+            return;
+        }
+        assert!(
+            resolved.load(Ordering::Acquire),
+            "request preceded revision resolution"
+        );
+        let tree_path = format!("/api/models/owner/repo/tree/{COMMIT}");
+        if path == format!("{tree_path}?recursive=true&limit=1000") {
             let body = br#"[
                 {"type":"file","oid":"3","size":4,"path":"c.bin"},
-                {"type":"file","oid":"1","size":4,"path":"a.bin"},
+                {"type":"file","oid":"1","size":4,"path":"a.bin"}
+            ]"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nLink: <{tree_path}?cursor=next>; rel=\"next\"\r\nConnection: close\r\n\r\n",
+                body.len()
+            ).unwrap();
+            stream.write_all(body).unwrap();
+            return;
+        }
+        if path == format!("{tree_path}?cursor=next") {
+            let body = br#"[
                 {"type":"file","oid":"2","size":4,"path":"b.bin"}
             ]"#;
             write_response(&mut stream, "application/json", body);
             return;
         }
-        if path.contains("/owner/repo/resolve/main/") {
+        if path.starts_with(&format!("/owner/repo/resolve/{COMMIT}/")) {
             let active_count = active.fetch_add(1, Ordering::AcqRel) + 1;
             maximum_active.fetch_max(active_count, Ordering::AcqRel);
             thread::sleep(Duration::from_millis(100));
             write_response(&mut stream, "application/octet-stream", b"data");
             active.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        if path.starts_with("/owner/repo/resolve/main/") {
+            write_response(&mut stream, "application/octet-stream", b"next");
             return;
         }
         write_response(&mut stream, "text/plain", b"not found");
@@ -1419,7 +1455,13 @@ mod tests {
                 path: conflict_path,
             };
             let files = [&first, &conflicting];
-            let result = prepare_tasks(&client, &args, Path::new("/tmp/agents/model"), &files);
+            let result = prepare_tasks(
+                &client,
+                &args,
+                &args.revision,
+                Path::new("/tmp/agents/model"),
+                &files,
+            );
             assert!(result.is_err());
             assert!(
                 result
@@ -1482,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_concurrent_downloads_and_preserves_output_order() {
+    fn pins_revision_across_pages_and_downloads_with_bounded_concurrency() {
         let (endpoint, stop, maximum_active, server) = start_download_server();
         let client = HubClient::at_endpoint(&endpoint, None).unwrap();
         let root = test_directory("concurrency");
@@ -1529,5 +1571,40 @@ mod tests {
         let progress = String::from_utf8(progress).unwrap();
         assert!(progress.contains("with 2 workers"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dry_run_uses_resolved_revision_without_creating_destination() {
+        let (endpoint, stop, maximum_active, server) = start_download_server();
+        let client = HubClient::at_endpoint(&endpoint, None).unwrap();
+        let root = test_directory("pinned-dry-run");
+        assert!(!root.exists());
+        let args = DownloadArgs {
+            repo: "owner/repo".parse().unwrap(),
+            patterns: Vec::new(),
+            repo_type: RepoType::Model,
+            revision: "main".to_owned(),
+            directory: Some(root.clone()),
+            force: false,
+            jobs: 2,
+            dry_run: true,
+        };
+        let mut output = Vec::new();
+        let mut progress = Vec::new();
+        let result = execute(
+            &client,
+            &args,
+            Path::new("/tmp/agents"),
+            &mut output,
+            &mut progress,
+            false,
+        );
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        result.unwrap();
+        assert_eq!(output, b"a.bin\nb.bin\nc.bin\n");
+        assert_eq!(maximum_active.load(Ordering::Acquire), 0);
+        assert!(progress.is_empty());
+        assert!(!root.exists());
     }
 }
