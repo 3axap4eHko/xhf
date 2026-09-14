@@ -1,0 +1,240 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/tmp/target
+  CARGO_TERM_COLOR: always
+  RUSTUP_HOME: ${{ github.workspace }}/tmp/rustup-home
+  RUST_TOOLCHAIN: 1.97.1
+  ZIG_VERSION: 0.15.2
+  ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+  CARGO_ZIGBUILD_VERSION: 0.23.4
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-14
+          - windows-2022
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set auto-self-update disable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+          echo "CARGO_HOME=$GITHUB_WORKSPACE/tmp/cargo-home" >> "$GITHUB_ENV"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
+      - name: Build release binary
+        run: cargo build --locked --release
+
+  package:
+    name: Verify package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set auto-self-update disable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          echo "CARGO_HOME=$GITHUB_WORKSPACE/tmp/cargo-home" >> "$GITHUB_ENV"
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "xhf") | .version')"
+          test "$TAG_NAME" = "v$package_version"
+      - name: Verify crates.io package
+        run: cargo publish --dry-run --locked
+      - name: Install packaged binary
+        shell: bash
+        run: cargo install --locked --path . --root "$GITHUB_WORKSPACE/tmp/install"
+      - name: Run installed binary
+        shell: bash
+        run: '"$GITHUB_WORKSPACE/tmp/install/bin/xhf" --version'
+
+  release-build:
+    name: Release build (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, package]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            zig: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            zig: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            zig: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            zig: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            zig: false
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set auto-self-update disable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+          echo "CARGO_HOME=$GITHUB_WORKSPACE/tmp/cargo-home" >> "$GITHUB_ENV"
+      - name: Install Zig
+        if: matrix.zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/tmp/tools/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          directory="$GITHUB_WORKSPACE/tmp/tools/zig-$ZIG_VERSION"
+          mkdir -p "$directory"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$archive" \
+            "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum --check -
+          tar -xJf "$archive" --strip-components=1 -C "$directory"
+          echo "$directory" >> "$GITHUB_PATH"
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-zigbuild --version "=$CARGO_ZIGBUILD_VERSION" --locked
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Build release binary with Zig
+        if: matrix.zig
+        run: cargo zigbuild --locked --release --target "$TARGET"
+        shell: bash
+      - name: Build release binary
+        if: ${{ ! matrix.zig }}
+        run: cargo build --locked --release --target "$TARGET"
+        shell: bash
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="xhf-$TARGET.tar.gz"
+          directory="$GITHUB_WORKSPACE/tmp/dist/stage/xhf-$TARGET"
+          mkdir -p "$directory" "$GITHUB_WORKSPACE/tmp/dist"
+          cp "$CARGO_TARGET_DIR/$TARGET/release/xhf" LICENSE README.md "$directory/"
+          tar -C "$GITHUB_WORKSPACE/tmp/dist/stage" -czf "$GITHUB_WORKSPACE/tmp/dist/$archive" "xhf-$TARGET"
+          cd "$GITHUB_WORKSPACE/tmp/dist"
+          sha256sum "$archive" > "$archive.sha256"
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archiveName = "xhf-$env:TARGET.zip"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "tmp/dist"
+          $directory = Join-Path $dist "stage/xhf-$env:TARGET"
+          $archivePath = Join-Path $dist $archiveName
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          Copy-Item (Join-Path $env:CARGO_TARGET_DIR "$env:TARGET/release/xhf.exe") $directory
+          Copy-Item LICENSE, README.md $directory
+          Compress-Archive -Path (Join-Path $directory "*") -DestinationPath $archivePath
+          $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
+          "$hash  $archiveName" | Set-Content -Encoding ascii "$archivePath.sha256"
+      - name: Upload release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            tmp/dist/*.tar.gz
+            tmp/dist/*.zip
+            tmp/dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: release-*
+          path: tmp/artifacts
+          merge-multiple: true
+      - name: Verify release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/tmp/artifacts"
+          shopt -s nullglob
+          checksums=(*.sha256)
+          archives=(*.tar.gz *.zip)
+          test "${#checksums[@]}" -eq 7
+          test "${#archives[@]}" -eq 7
+          sha256sum --check "${checksums[@]}"
+      - name: Create draft release and upload artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/tmp/artifacts"
+          gh release create "$TAG_NAME" \
+            ./*.tar.gz ./*.zip ./*.sha256 \
+            --draft \
+            --generate-notes \
+            --title "$TAG_NAME" \
+            --verify-tag
+          gh release edit "$TAG_NAME" --draft=false
