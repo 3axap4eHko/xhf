@@ -231,14 +231,27 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/tmp/artifacts"
-          gh release create "$TAG_NAME" \
-            ./*.tar.gz ./*.zip ./*.sha256 \
-            --draft \
-            --generate-notes \
-            --title "$TAG_NAME" \
-            --verify-tag
-          gh release edit "$TAG_NAME" --draft=false
+          state="$(gh release view "$TAG_NAME" --json isDraft --jq '.isDraft' 2>/dev/null || printf 'not_found\n')"
+          publish_after_upload=false
+
+          if [[ "$state" == "not_found" ]]; then
+            gh release create "$TAG_NAME" \
+              --draft \
+              --generate-notes \
+              --title "$TAG_NAME" \
+              --verify-tag
+            publish_after_upload=true
+          elif [[ "$state" == "true" ]]; then
+            publish_after_upload=true
+          fi
+
+          gh release upload "$TAG_NAME" ./*.tar.gz ./*.zip ./*.sha256 --clobber
+
+          if [[ "$publish_after_upload" == "true" ]]; then
+            gh release edit "$TAG_NAME" --draft=false
+          fi
