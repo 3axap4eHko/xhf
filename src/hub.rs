@@ -3,7 +3,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use reqwest::blocking::{Client, RequestBuilder, Response};
-use reqwest::header::LINK;
+use reqwest::header::{IF_RANGE, LINK, RANGE};
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
@@ -270,6 +270,32 @@ impl HubClient {
     pub(crate) fn file_response_for_url(&self, url: Url, path: &str) -> AppResult<Response> {
         self.validate_same_origin(&url)?;
         let request = self.authenticated(self.http.get(url));
+        self.send_checked(request, &format!("could not download {path:?}"))
+    }
+
+    pub(crate) fn file_range_response(
+        &self,
+        url: Url,
+        path: &str,
+        start: u64,
+        end: u64,
+        if_range: Option<&str>,
+    ) -> AppResult<Response> {
+        if start > end {
+            return Err(AppError::message(format!(
+                "invalid download range for {path:?}: start {start} exceeds end {end}"
+            )));
+        }
+        self.validate_same_origin(&url)?;
+        let request = self
+            .http
+            .get(url)
+            .header(RANGE, format!("bytes={start}-{end}"));
+        let request = match if_range {
+            Some(validator) => request.header(IF_RANGE, validator),
+            None => request,
+        };
+        let request = self.authenticated(request);
         self.send_checked(request, &format!("could not download {path:?}"))
     }
 

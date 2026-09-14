@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -157,7 +157,7 @@ pub struct DownloadArgs {
     /// Replace existing regular files.
     #[arg(long)]
     pub force: bool,
-    /// Maximum number of files downloaded concurrently.
+    /// Maximum number of simultaneous HTTP transfers.
     #[arg(long, default_value_t = 3, value_parser = parse_jobs)]
     pub jobs: usize,
     /// Print selected paths without writing files.
@@ -179,7 +179,7 @@ pub enum AuthCommand {
     Logout,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum RepoType {
     #[default]

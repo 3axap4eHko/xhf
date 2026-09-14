@@ -289,24 +289,28 @@ mod tests {
     use super::{Credentials, EnvironmentSnapshot, TokenSource};
 
     fn test_directory(name: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from("/tmp/agents").join(format!("xhf-{name}-{}", std::process::id()))
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tmp")
+            .join(format!("xhf-{name}-{}", std::process::id()))
     }
 
     #[test]
     fn xdg_path_precedes_home() {
-        let environment =
-            EnvironmentSnapshot::new(Some("/tmp/xdg".into()), Some("/tmp/home".into()), None);
+        let root = test_directory("path-resolution");
+        let xdg = root.join("xdg");
+        let home = root.join("home");
+        let environment = EnvironmentSnapshot::new(Some(xdg.clone()), Some(home), None);
         let credentials = Credentials::from_environment(&environment);
-        assert_eq!(
-            credentials.token_path().unwrap(),
-            std::path::Path::new("/tmp/xdg/xhf/token")
-        );
+        assert_eq!(credentials.token_path().unwrap(), xdg.join("xhf/token"));
     }
 
     #[test]
     fn environment_token_precedes_file() {
-        let environment =
-            EnvironmentSnapshot::new(None, Some("/tmp/home".into()), Some("from-env".to_owned()));
+        let environment = EnvironmentSnapshot::new(
+            None,
+            Some(test_directory("environment-token").join("home")),
+            Some("from-env".to_owned()),
+        );
         let credentials = Credentials::from_environment(&environment);
         assert_eq!(
             credentials.load().unwrap(),
