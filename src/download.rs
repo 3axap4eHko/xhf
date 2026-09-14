@@ -2336,6 +2336,7 @@ mod tests {
             while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let active = Arc::clone(&server_active);
                         let maximum_active = Arc::clone(&server_maximum_active);
                         let resolved = Arc::clone(&resolved);
@@ -2460,6 +2461,7 @@ mod tests {
             while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let active = Arc::clone(&server_active);
                         let maximum_active = Arc::clone(&server_maximum_active);
                         let ranges = Arc::clone(&server_ranges);
