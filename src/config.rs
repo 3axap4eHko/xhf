@@ -37,9 +37,14 @@ pub struct EnvironmentSnapshot {
 
 impl EnvironmentSnapshot {
     fn capture() -> Self {
+        #[cfg(windows)]
+        let home = windows_home(env::var_os("HOME"), env::var_os("USERPROFILE"));
+        #[cfg(not(windows))]
+        let home = env::var_os("HOME");
+
         Self {
             xdg_config_home: env::var_os("XDG_CONFIG_HOME"),
-            home: env::var_os("HOME"),
+            home,
             hf_token: env::var_os("HF_TOKEN"),
         }
     }
@@ -56,6 +61,12 @@ impl EnvironmentSnapshot {
             hf_token: hf_token.map(OsString::from),
         }
     }
+}
+
+#[cfg(any(windows, test))]
+fn windows_home(home: Option<OsString>, user_profile: Option<OsString>) -> Option<OsString> {
+    home.filter(|path| !path.is_empty())
+        .or_else(|| user_profile.filter(|path| !path.is_empty()))
 }
 
 #[derive(Clone, Debug)]
@@ -281,12 +292,13 @@ fn cleanup_after_error(path: &Path, original: AppError) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{Credentials, EnvironmentSnapshot, TokenSource};
+    use super::{Credentials, EnvironmentSnapshot, TokenSource, windows_home};
 
     fn test_directory(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -302,6 +314,34 @@ mod tests {
         let environment = EnvironmentSnapshot::new(Some(xdg.clone()), Some(home), None);
         let credentials = Credentials::from_environment(&environment);
         assert_eq!(credentials.token_path().unwrap(), xdg.join("xhf/token"));
+    }
+
+    #[test]
+    fn windows_home_falls_back_to_user_profile() {
+        let user_profile = test_directory("windows-user-profile");
+        let user_profile_value = user_profile.clone().into_os_string();
+        assert_eq!(
+            windows_home(None, Some(user_profile_value.clone())),
+            Some(user_profile_value.clone())
+        );
+        let home = windows_home(Some(OsString::new()), Some(user_profile_value))
+            .map(std::path::PathBuf::from);
+        let environment = EnvironmentSnapshot::new(None, home, None);
+        let credentials = Credentials::from_environment(&environment);
+        assert_eq!(
+            credentials.token_path().unwrap(),
+            user_profile.join(".config/xhf/token")
+        );
+    }
+
+    #[test]
+    fn windows_home_preserves_home_precedence() {
+        let home = OsString::from(r"C:\home");
+        let user_profile = OsString::from(r"C:\Users\ZENPIE");
+        assert_eq!(
+            windows_home(Some(home.clone()), Some(user_profile)),
+            Some(home)
+        );
     }
 
     #[test]

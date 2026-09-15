@@ -103,6 +103,8 @@ xhf auth logout
 
 `HF_TOKEN` takes precedence over the stored token. Authentication is required for private repositories and gated repositories granted to the token owner.
 
+Stored tokens use `$XDG_CONFIG_HOME/xhf/token`, falling back to `$HOME/.config/xhf/token`. On Windows, `%USERPROFILE%` supplies the home directory when `HOME` is unavailable, so the fallback is `%USERPROFILE%\.config\xhf\token`.
+
 ## License
 
 MIT
